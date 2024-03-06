@@ -1,7 +1,7 @@
 use crate::{error::ContractError, interface::*, msg::*, state::*};
 use cosmwasm_std::{
     coins, to_json_binary, wasm_instantiate, BankMsg, Binary, Deps, DepsMut, Env, Event,
-    MessageInfo, Reply, Response, StdError, StdResult,
+    MessageInfo, Reply, Response, StdError, StdResult, SubMsgResult,
 };
 
 pub fn instantiate(
@@ -49,6 +49,7 @@ pub fn execute(
         Donate {} => execute::donate(deps, info),
         Withdraw {} => execute::withdraw(deps, info),
         AddAdmin { admin } => execute::add_admin(deps, env, info, admin),
+        Execute { msg } => execute::execute_msg(deps, env, info, msg),
     }
 }
 
@@ -95,6 +96,10 @@ mod execute {
             },
         )?;
 
+        PRE_EXEC_BALANCE.update(deps.storage, |pre_balance| -> Result<u128, ContractError> {
+            Ok(pre_balance - withdrawable)
+        })?;
+
         let denom = DONATION_DENOM.load(deps.storage)?;
         let event = Event::new("withdraw")
             .add_attribute("admin", &admin)
@@ -104,6 +109,34 @@ mod execute {
             amount: coins(withdrawable, &denom),
         };
         Ok((message, event))
+    }
+
+    pub fn donation_storage_update(
+        deps: DepsMut,
+        distributed: u128,
+        admin_count: u128,
+        loaded_pre_balance: Option<u128>,
+    ) -> Result<(), ContractError> {
+        if distributed > 0 {
+            DONATED.update(deps.storage, |donated| -> Result<u128, ContractError> {
+                match donated.checked_add(distributed) {
+                    Some(x) => Ok(x),
+                    None => Err(ContractError::Overflow()),
+                }
+            })?;
+
+            let pre_balance = match loaded_pre_balance {
+                Some(x) => Some(x),
+                None => PRE_EXEC_BALANCE.may_load(deps.storage)?,
+            };
+
+            let new_balance = match pre_balance {
+                Some(x) => x + distributed * admin_count,
+                None => distributed * admin_count,
+            };
+            PRE_EXEC_BALANCE.save(deps.storage, &new_balance)?;
+        }
+        Ok(())
     }
 
     pub fn add_admin(
@@ -229,12 +262,9 @@ mod execute {
         let denom = DONATION_DENOM.load(deps.storage)?;
         let donation = cw_utils::must_pay(&info, &denom)?.u128();
         let admin_count = ADMIN_COUNT.load(deps.storage)?;
-        DONATED.update(deps.storage, |donated| -> Result<u128, ContractError> {
-            match donated.checked_add(donation / admin_count) {
-                Some(x) => Ok(x),
-                None => Err(ContractError::Overflow()),
-            }
-        })?;
+        let distributed = donation / admin_count;
+
+        donation_storage_update(deps, distributed, admin_count, None)?;
 
         let resp = Response::new().add_event(
             Event::new("donate")
@@ -246,6 +276,19 @@ mod execute {
     pub fn withdraw(mut deps: DepsMut, info: MessageInfo) -> Result<Response, ContractError> {
         let (message, event) = withdraw_helper(&mut deps, &info)?;
         let resp = Response::new().add_message(message).add_event(event);
+        Ok(resp)
+    }
+    pub fn execute_msg(
+        deps: DepsMut,
+        _env: Env,
+        info: MessageInfo,
+        msg: CosmosMsg,
+    ) -> Result<Response, ContractError> {
+        if !ADMINS.has(deps.storage, &info.sender) {
+            return Err(ContractError::AdminNotFound());
+        }
+        let sub = SubMsg::reply_always(msg, EXECUTE_COSMOS_MSG_ID);
+        let resp = Response::new().add_submessage(sub);
         Ok(resp)
     }
 }
@@ -288,9 +331,10 @@ mod query {
     }
 }
 
-pub fn reply(deps: DepsMut, _env: Env, msg: Reply) -> Result<Response, ContractError> {
+pub fn reply(deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
     match msg.id {
         VOTING_CONTRACT_INSTANTIATION_REPLY_ID => reply::voting_instantiation(deps, msg),
+        EXECUTE_COSMOS_MSG_ID => reply::check_balance(deps, env, msg),
         id => Err(ContractError::from(StdError::generic_err(format!(
             "Unknown reply id: {}",
             id
@@ -320,12 +364,56 @@ mod reply {
             Err(err) => Err(ContractError::from(err)),
         }
     }
+    pub fn check_balance(deps: DepsMut, env: Env, msg: Reply) -> Result<Response, ContractError> {
+        let result = msg.result;
+        match result {
+            SubMsgResult::Ok(_) => {
+                let denom = DONATION_DENOM.load(deps.storage)?;
+                let pre_balance = match PRE_EXEC_BALANCE.may_load(deps.storage) {
+                    Ok(balance) => match balance {
+                        Some(x) => x,
+                        None => 0,
+                    },
+                    Err(err) => return Err(ContractError::from(err)),
+                };
+                let curr_balance = deps
+                    .querier
+                    .query_balance(env.contract.address, denom)?
+                    .amount
+                    .u128();
+                if curr_balance < pre_balance {
+                    Err(ContractError::NotAllowedToSpend())
+                } else if curr_balance > pre_balance {
+                    let amount = curr_balance - pre_balance;
+                    let admin_count = ADMIN_COUNT.load(deps.storage)?;
+                    let distributed = amount / admin_count;
+                    execute::donation_storage_update(
+                        deps,
+                        distributed,
+                        admin_count,
+                        Some(pre_balance),
+                    )?;
+                    if distributed > 0 {
+                        Ok(Response::new().add_event(
+                            Event::new("distributed")
+                                .add_attribute("amount", (distributed * admin_count).to_string()),
+                        ))
+                    } else {
+                        Ok(Response::new())
+                    }
+                } else {
+                    Ok(Response::new())
+                }
+            }
+            SubMsgResult::Err(err) => Err(ContractError::from(StdError::generic_err(err))),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cosmwasm_std::{coin, Addr};
+    use cosmwasm_std::{coin, wasm_execute, Addr, CosmosMsg};
     use cw_multi_test::{App, AppResponse, ContractWrapper, Executor};
     use voting;
 
@@ -866,5 +954,155 @@ mod tests {
         );
         assert_eq!(get_balance(&app, "admin2", "eth"), 0);
         assert_eq!(get_balance(&app, "admin3", "eth"), donation2 / 3);
+    }
+
+    #[test]
+    fn test_execute_msg() {
+        let initial_balance = 1000;
+        let denom = "eth";
+        let mut app = App::new(|router, _, storage| {
+            router
+                .bank
+                .init_balance(
+                    storage,
+                    &Addr::unchecked("user1"),
+                    coins(initial_balance, denom),
+                )
+                .unwrap();
+        });
+        let voting_contract_code_id = voting_contract_code_id(&mut app);
+
+        let user_contract = instantiate_admin_contract(
+            &mut app,
+            InstantiateMsg {
+                admins: vec!["admin1".to_owned(), "admin2".to_owned()],
+                donation_denom: denom.to_string(),
+                voting_contract_code_id: voting_contract_code_id,
+            },
+        );
+
+        let addr = instantiate_admin_contract(
+            &mut app,
+            InstantiateMsg {
+                admins: vec![user_contract.to_string(), "admin3".to_owned()],
+                donation_denom: denom.to_string(),
+                voting_contract_code_id: voting_contract_code_id,
+            },
+        );
+
+        increment_block(&mut app);
+
+        let err = add_admin(&mut app, &addr, "admin1", "admin5").unwrap_err();
+        assert_eq!(ContractError::AdminNotFound(), err);
+
+        let msg = CosmosMsg::Wasm(
+            wasm_execute(
+                &addr,
+                &ExecuteMsg::AddAdmin {
+                    admin: "admin1".to_owned(),
+                },
+                vec![],
+            )
+            .unwrap(),
+        );
+        let resp = app
+            .execute_contract(
+                Addr::unchecked("admin1"),
+                user_contract.clone(),
+                &ExecuteMsg::Execute { msg: msg },
+                &[],
+            )
+            .unwrap();
+        resp.assert_event(
+            &Event::new("wasm-voting-initiated")
+                .add_attribute("by", user_contract.to_string())
+                .add_attribute("admin", "admin1"),
+        );
+        let voting_addr = Addr::unchecked(
+            resp.events
+                .iter()
+                .find(|e| e.ty == "wasm-voting-contract-instantiated")
+                .unwrap()
+                .attributes
+                .iter()
+                .find(|attr| attr.key == "address")
+                .unwrap()
+                .value
+                .to_string(),
+        );
+
+        let msg = CosmosMsg::Wasm(
+            wasm_execute(
+                &voting_addr,
+                &voting::msg::ExecuteMsg::SubmitVote { value: true },
+                vec![],
+            )
+            .unwrap(),
+        );
+        app.execute_contract(
+            Addr::unchecked("admin1"),
+            user_contract.clone(),
+            &ExecuteMsg::Execute { msg: msg },
+            &[],
+        )
+        .unwrap();
+        let resp = vote(&mut app, &voting_addr, "admin3", true).unwrap();
+        resp.assert_event(&Event::new("wasm-admin-added").add_attribute("admin", "admin1"));
+
+        let donation = 3;
+        donate(&mut app, &user_contract, "user1", donation, denom).unwrap();
+        let msg = CosmosMsg::Bank(BankMsg::Send {
+            to_address: "admin1".to_owned(),
+            amount: coins(donation, denom),
+        });
+        let err = app
+            .execute_contract(
+                Addr::unchecked("admin1"),
+                user_contract.clone(),
+                &ExecuteMsg::Execute { msg: msg },
+                &[],
+            )
+            .unwrap_err()
+            .downcast()
+            .unwrap();
+        assert_eq!(ContractError::NotAllowedToSpend(), err);
+
+        let msg = CosmosMsg::Bank(BankMsg::Send {
+            to_address: "admin1".to_owned(),
+            amount: coins(donation - (donation / 2) * 2, denom),
+        });
+        app.execute_contract(
+            Addr::unchecked("admin1"),
+            user_contract.clone(),
+            &ExecuteMsg::Execute { msg: msg },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(get_balance(&app, &user_contract, denom), 2);
+        assert_eq!(get_balance(&app, "admin1", denom), 1);
+
+        donate(&mut app, &user_contract, "user1", donation, denom).unwrap();
+        donate(&mut app, &user_contract, "user1", donation, denom).unwrap();
+        donate(&mut app, &user_contract, "user1", donation, denom).unwrap();
+        let msg = CosmosMsg::Bank(BankMsg::Send {
+            to_address: "admin1".to_owned(),
+            amount: coins(donation - (donation / 2) * 2, denom),
+        });
+        let resp = app
+            .execute_contract(
+                Addr::unchecked("admin1"),
+                user_contract.clone(),
+                &ExecuteMsg::Execute { msg: msg },
+                &[],
+            )
+            .unwrap();
+        resp.assert_event(&Event::new("wasm-distributed").add_attribute("amount", "2"));
+        assert_eq!(get_balance(&app, &user_contract, denom), 10);
+        assert_eq!(get_balance(&app, "admin1", denom), 2);
+        withdraw(&mut app, &user_contract, "admin1").unwrap();
+        withdraw(&mut app, &user_contract, "admin2").unwrap();
+        assert_eq!(get_balance(&app, &user_contract, denom), 0);
+        assert_eq!(get_balance(&app, "admin1", denom), 7);
+        assert_eq!(get_balance(&app, "admin2", denom), 5);
     }
 }

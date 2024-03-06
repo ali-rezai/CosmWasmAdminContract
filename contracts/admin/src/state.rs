@@ -14,3 +14,4 @@ pub const DONATION_DENOM: Item<String> = Item::new("donation_denom");
 pub const DONATED: Item<u128> = Item::new("donated");
 pub const VOTING_CONTRACT: Item<u64> = Item::new("voting_contract");
 pub const VOTING_TRACKER: Map<&Addr, Addr> = Map::new("voting_tracker");
+pub const PRE_EXEC_BALANCE: Item<u128> = Item::new("pre_exec_balance");

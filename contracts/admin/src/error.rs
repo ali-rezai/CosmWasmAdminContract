@@ -22,4 +22,6 @@ pub enum ContractError {
     LastAdmin(),
     #[error("{0}")]
     ParseReplyError(#[from] ParseReplyError),
+    #[error("Not allowed to spend donations")]
+    NotAllowedToSpend(),
 }

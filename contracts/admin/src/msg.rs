@@ -1,4 +1,5 @@
 use cosmwasm_schema::{cw_serde, QueryResponses};
+use cosmwasm_std::CosmosMsg;
 
 #[cw_serde]
 pub struct InstantiateMsg {
@@ -13,6 +14,7 @@ pub enum ExecuteMsg {
     Donate {},
     Withdraw {},
     AddAdmin { admin: String },
+    Execute { msg: CosmosMsg },
 }
 
 #[cw_serde]
@@ -42,3 +44,4 @@ pub enum QueryMsg {
 }
 
 pub const VOTING_CONTRACT_INSTANTIATION_REPLY_ID: u64 = 1;
+pub const EXECUTE_COSMOS_MSG_ID: u64 = 2;
