@@ -49,7 +49,7 @@ pub fn execute(
         Donate {} => execute::donate(deps, info),
         Withdraw {} => execute::withdraw(deps, info),
         AddAdmin { admin } => execute::add_admin(deps, env, info, admin),
-        Execute { msg } => execute::execute_msg(deps, env, info, msg),
+        Execute { msg } => execute::execute_msg(deps, info, msg),
     }
 }
 
@@ -280,7 +280,6 @@ mod execute {
     }
     pub fn execute_msg(
         deps: DepsMut,
-        _env: Env,
         info: MessageInfo,
         msg: CosmosMsg,
     ) -> Result<Response, ContractError> {
