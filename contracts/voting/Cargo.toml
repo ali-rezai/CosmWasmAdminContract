@@ -1,0 +1,24 @@
+[package]
+name = "voting"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+library = []
+
+[dependencies]
+cosmwasm-schema = "1.5.3"
+cosmwasm-std = "1.5.3"
+cw-storage-plus = "1.2.0"
+cw-utils = "1.0.3"
+serde = "1.0.197"
+thiserror = "1.0.57"
+
+[dev-dependencies]
+cw-multi-test = "0.20.0"
+admin = { path = "../admin" }
