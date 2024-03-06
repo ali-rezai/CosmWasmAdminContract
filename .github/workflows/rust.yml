@@ -16,9 +16,13 @@ jobs:
 
     steps:
     - uses: actions/checkout@v3
-    - name: Build
-      run: cargo wasm --verbose
-    - name: Check
+    - name: Add wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Install cosmwasm-check
+      run: cargo install cosmwasm-check
+    - name: Check Formatting
+      run: cargo fmt --all --check
+    - name: Check CosmWasm
       run: bash check.sh
     - name: Run tests
       run: cargo test --verbose
